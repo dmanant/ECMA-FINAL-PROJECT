@@ -1,0 +1,682 @@
+import pandas as pd
+import numpy as np
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import torch.nn as nn
+import torch.optim as optim
+
+from sklearn.preprocessing import StandardScaler
+from scipy.stats import boxcox
+from scipy.special import inv_boxcox
+
+from sklearn.model_selection import train_test_split
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import matplotlib.pyplot as plt
+
+from sklearn.impute import KNNImputer
+from sklearn.decomposition import FactorAnalysis
+from scipy.spatial.distance import cdist
+
+from sklearn.linear_model import Ridge
+
+df = pd.read_csv("uas_comprehensive1224.csv") # cannot provide any part of the data without registration through UAS
+
+# RESTRUCTURE DATA
+
+# convert data to floats and insert nan values
+for col in df.columns:
+    df[col] = pd.to_numeric(df[col], errors='coerce')
+    
+# find columns with second and third characters as "14", "15", or "16"
+columns_14 = [col for col in df.columns if len(col) > 2 and col[1:3] == "14"]
+columns_15 = [col for col in df.columns if len(col) > 2 and col[1:3] == "15"]
+columns_16 = [col for col in df.columns if len(col) > 2 and col[1:3] == "16"]
+
+# create base variable names without the second and third characters
+base_14 = {col[:1] + col[3:]: col for col in columns_14}
+base_15 = {col[:1] + col[3:]: col for col in columns_15}
+base_16 = {col[:1] + col[3:]: col for col in columns_16}
+
+# find common variables
+common_vars = set(base_14.keys()) & set(base_15.keys()) & set(base_16.keys())
+
+# "stack" the three values for each person as three new rows
+stacked_data = {}
+
+for var in common_vars:
+    stacked_values = []
+    for i in range(len(df)):
+        values = [
+            df.at[i, base_14[var]],
+            df.at[i, base_15[var]],
+            df.at[i, base_16[var]]
+        ]
+        
+        # if at least one of the three is not nan, set the nan values to average of existing values
+        if any(pd.notna(values)):
+            mean_value = np.nanmean(values)
+            values = [val if pd.notna(val) else mean_value for val in values]
+        
+        stacked_values.extend(values)
+        
+    stacked_data[var] = stacked_values
+
+df_stacked = pd.DataFrame(stacked_data)
+
+# stack each demographic variable three times for each of the three years for every user
+columns_ra = [col for col in df.columns if col[:2] == "ra"]
+df_ra = df[columns_ra]
+expanded_data = {}
+
+for col in columns_ra:
+    expanded_values = []
+    for value in df_ra[col]:
+        expanded_values.extend([value] * 3)
+    
+    expanded_data[col] = expanded_values
+
+df_expanded_ra = pd.DataFrame(expanded_data)
+
+# transform "uasid" column for the three years
+uasid_values = []
+
+for value in df["uasid"]:
+    uasid_values.extend([int(f"{int(value)}14"), int(f"{int(value)}15"), int(f"{int(value)}16")])
+
+df_uasid = pd.DataFrame({"uasid": uasid_values})
+
+# stack financial health scores for each of the three years
+financial_health_cols = ["qfhn13_2018score_total", "qfhn14_2020score_total", "qfhn15_2022score_total"]
+financial_health_values = []
+
+for i in range(len(df)):
+    financial_health_values.append(df.at[i, financial_health_cols[0]])  # 2018 score
+    financial_health_values.append(df.at[i, financial_health_cols[1]])  # 2020 score
+    financial_health_values.append(df.at[i, financial_health_cols[2]])  # 2022 score
+
+df_financial_health = pd.DataFrame({"Financial Health Score": financial_health_values})
+
+# combine dataframes
+df_final = pd.concat([df_uasid, df_stacked, df_expanded_ra, df_financial_health], axis=1)
+df_final = df_final.dropna(axis=1, how="all")
+
+df_final.to_csv("cleaned_data.csv", index=False) # store for later
+
+# RESTRUCTURE FOR TRAINING
+
+# drop rows with na fin scores
+financial_score_column = "Financial Health Score"
+df_cleaned = df_final.dropna(subset=[financial_score_column, "uasid"])
+
+# save locations of nan values before scaling
+features = df_cleaned.drop(columns=[financial_score_column, "uasid"])
+
+# replace imputed error values
+features.replace([98, 99], np.nan, inplace=True)
+
+missing_mask = features.isna()
+
+# replace nan values with column means for scaling
+features_filled = features.copy()
+features_filled.fillna(features_filled.mean(), inplace=True)
+
+# scale columns
+scaler = StandardScaler()
+scaled_features = scaler.fit_transform(features_filled)
+
+df_scaled = pd.DataFrame(scaled_features, columns=features.columns)
+
+# put back in nan values
+df_scaled[missing_mask] = float("nan")
+
+df_cleaned = df_cleaned.reset_index(drop=True)
+df_scaled = df_scaled.reset_index(drop=True)
+
+# scale financial scores using boxcox
+df_cleaned[financial_score_column] += 1
+df_cleaned[financial_score_column], lambda_value = boxcox(df_cleaned[financial_score_column])
+
+target_mean = df_cleaned[financial_score_column].mean()
+target_std = df_cleaned[financial_score_column].std()
+
+df_scaled[financial_score_column] = (df_cleaned[financial_score_column] - target_mean) / target_std
+train_df, test_df = train_test_split(df_scaled, test_size=0.2)
+
+# TRAIN DATA
+
+# convert dataframe to PyTorch datasets
+class SurveyDataset(Dataset):
+    def __init__(self, df, target_col):
+        self.features = df.drop(columns=[target_col]).values
+        self.target = df[target_col].values
+    
+    def __len__(self):
+        return len(self.features)
+    
+    def __getitem__(self, idx):
+        return torch.tensor(self.features[idx], dtype=torch.float32), torch.tensor(self.target[idx], dtype=torch.float32)
+        
+# neural network
+class FinancialHealthModel(nn.Module):
+    def __init__(self, input_dim):
+        super(FinancialHealthModel, self).__init__()
+        self.mask_value = -1
+        self.fc1 = nn.Linear(input_dim, 512)
+        self.bn1 = nn.BatchNorm1d(512)
+        self.dropout1 = nn.Dropout(0.3)
+
+        self.fc2 = nn.Linear(512, 256)
+        self.bn2 = nn.BatchNorm1d(256)
+        self.dropout2 = nn.Dropout(0.3)
+
+        self.fc3 = nn.Linear(256, 128)
+        self.bn3 = nn.BatchNorm1d(128)
+        self.dropout3 = nn.Dropout(0.2)
+
+        self.output = nn.Linear(128, 1)
+
+    def forward(self, x):
+        mask = (x != self.mask_value).float()
+        x = x * mask
+        x = torch.relu(self.bn1(self.fc1(x)))
+        x = self.dropout1(x)
+        x = torch.relu(self.bn2(self.fc2(x)))
+        x = self.dropout2(x)
+        x = torch.relu(self.bn3(self.fc3(x)))
+        x = self.dropout3(x)
+        return self.output(x)
+
+# Initialize Model
+input_dim = df_scaled.shape[1] - 1
+model = FinancialHealthModel(input_dim)
+
+# Training with Early Stopping
+def train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, max_epochs=5000):
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    
+    model.train()
+
+    best_loss = float("inf")
+    patience = 15
+    patience_counter = 0
+    loss_arr = []
+
+    for epoch in range(max_epochs):
+        train_loss = 0.0
+        for features, target in train_loader:
+            optimizer.zero_grad()
+            predictions = model(features)
+            loss = criterion(predictions.squeeze(), target)
+
+            # check for nan loss
+            if torch.isnan(loss):
+                print(f"NaN loss detected at epoch {epoch}, stopping training.")
+                return loss_arr
+            
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+
+        # validation phase
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for features, target in test_loader:
+                predictions = model(features)
+                loss = criterion(predictions.squeeze(), target)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(test_loader)
+        loss_arr.append(avg_val_loss)
+        print(f"Epoch {epoch}, Train Loss: {train_loss:.4f}, Validation Loss: {avg_val_loss:.4f}")
+
+        # reduce learning rate if needed
+        scheduler.step(avg_val_loss)
+
+        # early stopping 
+        if avg_val_loss < best_loss:
+            best_loss = avg_val_loss
+            patience_counter = 0
+        else:
+            patience_counter += 1
+
+        if patience_counter >= patience:
+            print(f"Early stopping at epoch {epoch}, best validation loss: {best_loss:.4f}")
+            break
+
+    return loss_arr
+
+# Evaluation function
+def evaluate_model(model, test_loader, criterion, target_mean, target_std):
+    model.eval()
+    total_loss = 0.0
+    count = 0
+    actuals = []
+    predictions = []
+    within_5 = []
+    within_3 = []
+    within_10 = []
+    within_20 = []
+    within_30 = []
+    question_counts = []
+    absolute_differences = []
+    differences = []
+
+    with torch.no_grad():
+        for features, target in test_loader:
+            pred = model(features)
+            loss = criterion(pred.squeeze(), target)
+            total_loss += loss.item()
+            count += 1
+
+            # convert back from boxcox
+            actual_values_boxcox = (target.numpy() * target_std) + target_mean
+            predicted_values_boxcox = (pred.squeeze().numpy() * target_std) + target_mean
+
+            actual_values = inv_boxcox(actual_values_boxcox, lambda_value) - 1
+            predicted_values = inv_boxcox(predicted_values_boxcox, lambda_value) - 1
+
+            # ensure values stay within 0-100 range
+            actual_values = np.clip(actual_values, 0, 100)
+            predicted_values = np.clip(predicted_values, 0, 100)
+
+            # calculate absolute difference
+            abs_diff = np.abs(actual_values - predicted_values)
+            absolute_differences.extend(abs_diff)
+
+            # calculate difference
+            diff = actual_values - predicted_values
+            differences.extend(diff)
+
+            # calculate if within 3, 5, 10, 20, 30 points
+            within_3.extend(abs_diff <= 3)
+            within_5.extend(abs_diff <= 5)
+            within_10.extend(abs_diff <= 10)
+            within_20.extend(abs_diff <= 20)
+            within_30.extend(abs_diff <= 30)
+
+            # count the number of answered questions
+            question_counts.extend((features.numpy() != -1).sum(axis=1))
+
+            actuals.extend(actual_values)
+            predictions.extend(predicted_values)
+    
+    # convert "within" lists to integers (1 if within 10, else 0)
+    within_3 = [int(val) for val in within_3]
+    within_5 = [int(val) for val in within_5]
+    within_10 = [int(val) for val in within_10]
+    within_20 = [int(val) for val in within_20]
+    within_30 = [int(val) for val in within_30]
+
+    results_df = pd.DataFrame({
+        "Actual Financial Score": actuals,
+        "Predicted Financial Score": predictions,
+        "Absolute Difference": absolute_differences,
+        "Difference": differences,
+        "Within 3 Points": within_3,
+        "Within 5 Points": within_5,
+        "Within 10 Points": within_10,
+        "Within 20 Points": within_20,
+        "Within 30 Points": within_30,
+        "Questions Answered": question_counts
+    })
+
+    # compute average loss
+    avg_loss = total_loss / count
+
+    # compute average absolute difference
+    avg_abs_diff = np.mean(absolute_differences)
+    
+    # Compute the percentage of values within 3, 5, 10, 20, 30 points
+    within_3_percent = (sum(within_3) / len(within_3)) * 100
+    within_5_percent = (sum(within_5) / len(within_5)) * 100
+    within_10_percent = (sum(within_10) / len(within_10)) * 100
+    within_20_percent = (sum(within_20) / len(within_20)) * 100
+    within_30_percent = (sum(within_30) / len(within_30)) * 100
+
+    return avg_loss, avg_abs_diff, results_df, within_3_percent, within_5_percent, within_10_percent, within_20_percent, within_30_percent
+
+# function for running multiple evaluations
+def runt(df):
+
+    results = []
+    within_3 = []
+    within_5 = []
+    within_10 = []
+    within_20 = []
+    within_30 = []
+    financial_score_column = "Financial Health Score"
+    
+    for i in range(30):
+
+        df.fillna(-1, inplace=True)
+    
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state = 42 * i)
+    
+        # create train and test datasets and dataloaders
+        train_dataset = SurveyDataset(train_df, financial_score_column)
+        test_dataset = SurveyDataset(test_df, financial_score_column)
+        
+        train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+        test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
+        
+        # initialize the model
+        input_dim = df_scaled.shape[1] - 1
+        criterion = torch.nn.SmoothL1Loss()
+        loss_arr = []
+        
+        # initialize learning rate scheduler and early stopping
+        model = FinancialHealthModel(input_dim)
+        optimizer = optim.Adam(model.parameters(), lr=0.0001)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.2, patience=6, verbose=True)
+    
+        patience = 15
+        best_loss = float("inf")
+        patience_counter = 0
+        loss_arr = []
+        
+        train_loss = train_model(model, train_loader, test_loader, criterion, optimizer, scheduler, max_epochs=5000)
+        
+        # run evaluation
+        test_loss, avg_abs_diff, results_df, within_3_percent, within_5_percent, within_10_percent, within_20_percent, within_30_percent = evaluate_model(model, test_loader, criterion, target_mean, target_std)
+        
+        results.append(results_df)
+        within_3.append(within_3_percent)
+        within_5.append(within_5_percent)
+        within_10.append(within_10_percent)
+        within_20.append(within_20_percent)
+        within_30.append(within_30_percent)
+
+    return results, within_3, within_5, within_10, within_20, within_30
+
+# IMPUTERS
+
+# mean
+df_mean = df_scaled.copy()
+df_mean.fillna(df_mean.mean(), inplace=True)
+mean_val_results, mean_val_3, mean_val_5, mean_val_10, mean_val_20, mean_val_30 = runt(df_mean)
+
+# mode
+df_mean.to_csv("mean_imputed.csv", index=False)
+df_mode = df_scaled.copy()
+df_mode.fillna(df_mode.mode().iloc[0], inplace=True)
+mode_val_results, mode_val_3, mode_val_5, mode_val_10, mode_val_20, mode_val_30 = runt(df_mode)
+
+# binary masking
+df_mode.to_csv("mode_imputed.csv", index=False)
+df_bin = df_scaled.copy()
+df_bin.fillna(-1, inplace=True)
+bin_val_results, bin_val_3, bin_val_5, bin_val_10, bin_val_20, bin_val_30 = runt(df_bin)
+
+# correlation
+def impute_missing_values(df, threshold=0.6):
+    
+    # compute correlation matrix
+    corr_matrix = df.corr()
+    
+    # sort correlations and find best correlated columns for each
+    correlated_features = {}
+    for col in df.columns:
+        correlated_cols = corr_matrix[col].dropna().abs().sort_values(ascending=False)
+        correlated_cols = correlated_cols[correlated_cols > threshold].index.tolist()
+        correlated_features[col] = [c for c in correlated_cols if c != col]
+    
+    # impute missing values based on the most correlated column
+    # stop at the first valid correlated column
+    df_imputed = df.copy()
+    for index, row in df.iterrows():
+        for col in df.columns:
+            if pd.isna(row[col]):
+                for correlated_col in correlated_features[col]:
+                    if pd.notna(row[correlated_col]):
+                        df_imputed.at[index, col] = row[correlated_col]
+                        break
+    
+    return df_imputed
+
+df_corr = df_scaled.copy()
+df_corr = impute_missing_values(df_corr, threshold=0.6)
+corr_val_results, corr_val_3, corr_val_5, corr_val_10, corr_val_20, corr_val_30 = runt(df_corr)
+ 
+# knn
+def impute_missing_values_knn(df, n_neighbors=5):
+    
+    df_imputed = df.copy()
+    knn_imputer = KNNImputer(n_neighbors=n_neighbors, weights="uniform")
+    
+    # do knn imputation
+    df_imputed[:] = knn_imputer.fit_transform(df_imputed)
+    
+    return df_imputed
+
+df_knn = df_scaled.copy()
+df_knn = impute_missing_values_knn(df_knn, n_neighbors=5)  # Adjust n_neighbors if needed
+knn_val_results, knn_val_3, knn_val_5, knn_val_10, knn_val_20, knn_val_30 = runt(df_knn)
+
+# factor analysis
+def impute_missing_values_factor_analysis(df, n_components=10):
+    
+    df_imputed = df.copy()
+    
+    # store original missing value mask and input mean
+    missing_mask = df_imputed.isna()
+    df_imputed.fillna(df_imputed.mean(), inplace=True)
+    
+    # fit factor
+    factor_model = FactorAnalysis(n_components=n_components, random_state=42)
+    transformed_data = factor_model.fit_transform(df_imputed)
+    
+    # reconstruct
+    reconstructed_data = np.dot(transformed_data, factor_model.components_)
+    
+    # convert reconstructed data back to DataFrame
+    reconstructed_df = pd.DataFrame(reconstructed_data, index=df.index, columns=df.columns)
+    
+    # replace missing values
+    df_imputed[missing_mask] = reconstructed_df[missing_mask]
+    
+    return df_imputed
+
+df_factor = df_scaled.copy()
+df_factor = impute_missing_values_factor_analysis(df_factor, n_components=10)
+factor_val_results, factor_val_3, factor_val_5, factor_val_10, factor_val_20, factor_val_30 = runt(df_factor)
+
+# rpm
+def impute_missing_values_rpm(df, top_k=5):
+    
+    df_imputed = df.copy()
+    
+    # create a binary mask of answered questions (1 = answered, 0 = missing)
+    response_mask = df.notna().astype(int)
+    
+    # compute  distances between respondents based on response patterns
+    distance_matrix = cdist(response_mask, response_mask, metric='hamming')
+    
+    # go through each row (respondent)
+    for i in range(len(df)):
+        missing_cols = df.iloc[i].isna()
+        if missing_cols.sum() == 0:
+            continue
+        
+        # find indices of top-K closest respondents
+        closest_indices = np.argsort(distance_matrix[i])[1:top_k+1]
+        
+        # fill in missing values based on closest matches
+        for col in df.columns[missing_cols]:
+            possible_values = df.iloc[closest_indices][col].dropna()
+            if not possible_values.empty:
+                if df[col].dtype in [np.float64, np.int64]:
+                    df_imputed.at[i, col] = possible_values.mean()
+                else:
+                    df_imputed.at[i, col] = possible_values.mode()[0]
+    
+    return df_imputed
+
+df_rpm = df_scaled.copy()
+df_rpm = impute_missing_values_rpm(df_rpm, top_k=5)
+rpm_val_results, rpm_val_3, rpm_val_5, rpm_val_10, rpm_val_20, rpm_val_30 = runt(df_rpm)
+
+# autoencoder
+
+# define autoencoder model
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super(Autoencoder, self).__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.ReLU()
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(64, 128),
+            nn.ReLU(),
+            nn.Linear(128, 256),
+            nn.ReLU(),
+            nn.Linear(256, input_dim)
+        )
+
+    def forward(self, x):
+        encoded = self.encoder(x)
+        decoded = self.decoder(encoded)
+        return decoded
+
+# define dataset
+class ImputationDataset(Dataset):
+    def __init__(self, data):
+        self.data = torch.tensor(data, dtype=torch.float32)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        return self.data[idx], self.data[idx]
+
+# function to impute missing values using autoencoder
+def impute_missing_values_autoencoder(df, epochs=200, batch_size=64, lr=0.001):
+    
+    df_imputed = df.copy()
+    missing_mask = df.isna().values
+
+    # replace nans with column means
+    col_means = df.mean()
+    df_filled = df.fillna(col_means)
+    data = df_filled.values
+
+    # define model
+    input_dim = data.shape[1]
+    model = Autoencoder(input_dim)
+    
+    # loss and optimizer
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # create dataloaders
+    dataset = ImputationDataset(data)
+    dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+    # training loop
+    model.train()
+    for epoch in range(epochs):
+        epoch_loss = 0.0
+        for inputs, targets in dataloader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch {epoch+1}/{epochs}, Loss: {epoch_loss:.4f}")
+
+    # generate imputed values
+    model.eval()
+    with torch.no_grad():
+        reconstructed = model(torch.tensor(data, dtype=torch.float32)).numpy()
+
+    # replace missing values
+    df_imputed.values[missing_mask] = reconstructed[missing_mask]
+
+    return df_imputed
+
+df_autoencoder = df_scaled.copy()
+df_autoencoder = impute_missing_values_autoencoder(df_autoencoder, epochs=300)
+autoencoder_val_results, autoencoder_val_3, autoencoder_val_5, autoencoder_val_10, autoencoder_val_20, autoencoder_val_30 = runt(df_autoencoder)
+
+# function for plotting accuracy values over iterations 
+def plot_res(res_arr):
+
+    std_arr = []
+    iterations = np.arange(1, len(res_arr[0][0]) + 1)
+    
+    plt.figure(figsize=(10, 6))
+    
+    for res, name in res_arr:
+        res = np.array(res)
+        std_arr.append(np.std(res))
+        plt.plot(iterations, res, 'o-', label=f"{name}")
+        plt.errorbar(iterations, res, yerr=np.std(res)/np.sqrt(30), fmt='o', capsize=3, alpha=0.5)
+
+    plt.xlabel("Iteration Number")
+    plt.ylabel("Accuracy (%)")
+    plt.title("Accuracy Across Imputation Methods")
+    plt.xticks(iterations)
+    plt.grid(axis="y", linestyle="--", alpha=0.7)
+    plt.legend()
+
+    plt.show()
+    
+plot_res([(mean_val_10, "mean"), (mode_val_10, "mode"), (bin_val_10, "bin"), (corr_val_10, "corr"), (knn_val_10, "knn"), (factor_val_10, "factor"), (rpm_val_10, "rpm"), (autoencoder_val_10, "autoencoder")])
+
+# ridge comparison
+df_ridge = df_scaled.copy()
+df_ridge.fillna(df_ridge.mean(), inplace=True)
+
+X = df_ridge.drop(columns=["Financial Health Score"]).values
+y = df_ridge["Financial Health Score"].values
+
+ridge_results = []
+ridge_within_3 = []
+ridge_within_5 = []
+ridge_within_10 = []
+ridge_within_20 = []
+ridge_within_30 = []
+
+for i in range(30):  
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42 * i)
+    
+    # define ridge regression model
+    ridge_model = Ridge(alpha=1.0)
+
+    # train
+    ridge_model.fit(X_train, y_train)
+    
+    # predict on test data
+    y_pred = ridge_model.predict(X_test)
+    
+    # reverse boxcox
+    actual_values_boxcox = (y_test * target_std) + target_mean
+    predicted_values_boxcox = (y_pred * target_std) + target_mean
+
+    actual_values = inv_boxcox(actual_values_boxcox, lambda_value) - 1
+    predicted_values = inv_boxcox(predicted_values_boxcox, lambda_value) - 1
+
+    actual_values = np.clip(actual_values, 0, 100)
+    predicted_values = np.clip(predicted_values, 0, 100)
+
+    # calculate absolute difference
+    abs_diff = np.abs(actual_values - predicted_values)
+
+    # compute accuracy within each threshold
+    ridge_within_3.append(np.mean(abs_diff <= 3) * 100)
+    ridge_within_5.append(np.mean(abs_diff <= 5) * 100)
+    ridge_within_10.append(np.mean(abs_diff <= 10) * 100)
+    ridge_within_20.append(np.mean(abs_diff <= 20) * 100)
+    ridge_within_30.append(np.mean(abs_diff <= 30) * 100)
